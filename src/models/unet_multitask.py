@@ -42,7 +42,7 @@ class MultiTaskUNet(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(base * 16, base * 4),
-            nn.BatchNorm1d(base * 4),
+            nn.LayerNorm(base * 4),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(base * 4, base),
