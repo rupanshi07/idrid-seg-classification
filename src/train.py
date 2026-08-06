@@ -3,6 +3,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from itertools import cycle
 
 from src.datasets.idrid_dataset import SegDataset, ClsDataset
@@ -22,15 +23,17 @@ def evaluate(model, seg_loader, cls_loader, device):
         for batch in seg_loader:
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
-            seg_logits, _ = model(images, task="seg")
-            dice = mean_dice_per_lesion(seg_logits, masks)
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                seg_logits, _ = model(images, task="seg")
+            dice = mean_dice_per_lesion(seg_logits.float(), masks)
             dice_sum += dice.cpu()
             n_batches += 1
 
         for batch in cls_loader:
             images = batch["image"].to(device)
             grades = batch["grade"].to(device)
-            _, cls_logits = model(images, task="cls")
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                _, cls_logits = model(images, task="cls")
             preds = cls_logits.argmax(dim=1)
             correct += (preds == grades).sum().item()
             total += grades.size(0)
@@ -43,10 +46,10 @@ def evaluate(model, seg_loader, cls_loader, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default=r"D:\IDRID2\DATASET")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--img_size", type=int, default=512)
+    parser.add_argument("--img_size", type=int, default=384)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
@@ -68,7 +71,8 @@ def main():
     seg_loss_fn = SegComboLoss()
     cls_loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
 
     best_mean_dice = 0.0
 
@@ -88,15 +92,18 @@ def main():
 
             optimizer.zero_grad()
 
-            seg_logits, _ = model(images_seg, task="seg")
-            seg_loss = seg_loss_fn(seg_logits, masks)
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                seg_logits, _ = model(images_seg, task="seg")
+                seg_loss = seg_loss_fn(seg_logits, masks)
 
-            _, cls_logits = model(images_cls, task="cls")
-            cls_loss = cls_loss_fn(cls_logits, grades)
+                _, cls_logits = model(images_cls, task="cls")
+                cls_loss = cls_loss_fn(cls_logits, grades)
 
-            loss = seg_loss + cls_loss
-            loss.backward()
-            optimizer.step()
+                loss = seg_loss + cls_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_seg_loss += seg_loss.item()
             running_cls_loss += cls_loss.item()
