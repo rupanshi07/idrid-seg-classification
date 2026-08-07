@@ -9,17 +9,18 @@ from itertools import cycle
 from src.datasets.idrid_dataset import SegDataset, ClsDataset
 from src.datasets.patch_dataset import PatchSegDataset
 from src.models.unet_multitask import MultiTaskUNet
-from src.losses.losses import SegComboLoss, mean_dice_per_lesion
+from src.losses.losses import SegComboLoss, mean_dice_per_lesion, quadratic_weighted_kappa
 
 LESIONS = ["Microaneurysms", "Haemorrhages", "Hard_Exudates", "Soft_Exudates", "Optic_Disc"]
 POS_WEIGHT = torch.tensor([28.8, 9.9, 10.7, 22.7, 7.4])
+CLS_WEIGHT = torch.tensor([0.6164, 4.13, 0.6074, 1.1162, 1.6857])
 
 
 def evaluate(model, seg_loader, cls_loader, device):
     model.eval()
     dice_sum = torch.zeros(5)
     n_batches = 0
-    correct, total = 0, 0
+    all_preds, all_targets = [], []
 
     with torch.no_grad():
         for batch in seg_loader:
@@ -37,12 +38,13 @@ def evaluate(model, seg_loader, cls_loader, device):
             with autocast(device_type="cuda", enabled=(device.type == "cuda")):
                 _, cls_logits = model(images, task="cls")
             preds = cls_logits.argmax(dim=1)
-            correct += (preds == grades).sum().item()
-            total += grades.size(0)
+            all_preds.extend(preds.cpu().tolist())
+            all_targets.extend(grades.cpu().tolist())
 
     mean_dice = dice_sum / max(n_batches, 1)
-    acc = correct / max(total, 1)
-    return mean_dice, acc
+    acc = sum(p == t for p, t in zip(all_preds, all_targets)) / max(len(all_targets), 1)
+    qwk = quadratic_weighted_kappa(all_preds, all_targets) if len(all_targets) > 0 else 0.0
+    return mean_dice, acc, qwk
 
 
 def main():
@@ -63,10 +65,11 @@ def main():
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     train_seg = PatchSegDataset(args.data_root, split="Training", img_size=args.eval_img_size,
-                                 patch_size=args.patch_size, patches_per_image=args.patches_per_image)
+                                 patch_size=args.patch_size, patches_per_image=args.patches_per_image,
+                                 augment=True)
     test_seg = SegDataset(args.data_root, split="Testing", img_size=args.eval_img_size)
-    train_cls = ClsDataset(args.data_root, split="Training", img_size=args.eval_img_size)
-    test_cls = ClsDataset(args.data_root, split="Testing", img_size=args.eval_img_size)
+    train_cls = ClsDataset(args.data_root, split="Training", img_size=args.eval_img_size, augment=True)
+    test_cls = ClsDataset(args.data_root, split="Testing", img_size=args.eval_img_size, augment=False)
 
     train_seg_loader = DataLoader(train_seg, batch_size=args.patch_batch_size, shuffle=True, num_workers=2)
     train_cls_loader = DataLoader(train_cls, batch_size=args.cls_batch_size, shuffle=True, num_workers=2)
@@ -75,7 +78,7 @@ def main():
 
     model = MultiTaskUNet().to(device)
     seg_loss_fn = SegComboLoss(pos_weight=POS_WEIGHT)
-    cls_loss_fn = nn.CrossEntropyLoss()
+    cls_loss_fn = nn.CrossEntropyLoss(weight=CLS_WEIGHT.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
     scaler = GradScaler(enabled=(device.type == "cuda"))
@@ -115,12 +118,13 @@ def main():
             running_cls_loss += cls_loss.item()
             n_steps += 1
 
-        mean_dice, acc = evaluate(model, test_seg_loader, test_cls_loader, device)
+        mean_dice, acc, qwk = evaluate(model, test_seg_loader, test_cls_loader, device)
         overall_dice = mean_dice.mean().item()
         scheduler.step(overall_dice)
 
         print(f"Epoch {epoch}/{args.epochs} | seg_loss={running_seg_loss/n_steps:.4f} "
-              f"cls_loss={running_cls_loss/n_steps:.4f} | mean_dice={overall_dice:.4f} | cls_acc={acc:.4f}")
+              f"cls_loss={running_cls_loss/n_steps:.4f} | mean_dice={overall_dice:.4f} | "
+              f"cls_acc={acc:.4f} | cls_qwk={qwk:.4f}")
         for lesion, d in zip(LESIONS, mean_dice.tolist()):
             print(f"    {lesion}: {d:.4f}")
 

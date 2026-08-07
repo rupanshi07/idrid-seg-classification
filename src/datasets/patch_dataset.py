@@ -4,22 +4,28 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import albumentations as A
 
 LESIONS = ["Microaneurysms", "Haemorrhages", "Hard_Exudates", "Soft_Exudates", "Optic_Disc"]
 
+SEG_AUG = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+    A.CLAHE(clip_limit=2.0, p=0.3),
+])
+
 
 class PatchSegDataset(Dataset):
-    """
-    Loads full training images/masks once at img_size resolution, caches in memory,
-    and serves random patches biased toward lesion-containing regions.
-    """
     def __init__(self, root, split="Training", img_size=1024, patch_size=256,
-                 patches_per_image=6, lesion_bias=0.75):
+                 patches_per_image=6, lesion_bias=0.75, augment=True):
         set_name = "a_Training_Set" if split == "Training" else "b_Testing_Set"
         self.img_size = img_size
         self.patch_size = patch_size
         self.patches_per_image = patches_per_image
         self.lesion_bias = lesion_bias
+        self.augment = augment and (split == "Training")
 
         img_dir = os.path.join(root, "A_Segmentation", "Original_Images", set_name)
         mask_dirs = {
@@ -30,7 +36,7 @@ class PatchSegDataset(Dataset):
 
         self.images = []
         self.masks = []
-        self.fg_coords = []  # list of (row, col) arrays per image, union across all lesions
+        self.fg_coords = []
 
         for img_path in image_paths:
             patient_id = os.path.splitext(os.path.basename(img_path))[0]
@@ -48,17 +54,17 @@ class PatchSegDataset(Dataset):
                 else:
                     m = np.zeros((img_size, img_size), dtype=np.uint8)
                 masks.append(m)
-            mask_stack = np.stack(masks, axis=0)  # [5, H, W]
+            mask_stack = np.stack(masks, axis=0)
 
             union_fg = (mask_stack.sum(axis=0) > 0)
-            coords = np.argwhere(union_fg)  # [[row, col], ...]
+            coords = np.argwhere(union_fg)
 
             self.images.append(image)
             self.masks.append(mask_stack)
             self.fg_coords.append(coords)
 
         print(f"PatchSegDataset: cached {len(self.images)} images at {img_size}px, "
-              f"{patches_per_image} patches/image/epoch")
+              f"{patches_per_image} patches/image/epoch, augment={self.augment}")
 
     def __len__(self):
         return len(self.images) * self.patches_per_image
@@ -83,6 +89,12 @@ class PatchSegDataset(Dataset):
 
         img_patch = image[y0:y0 + ps, x0:x0 + ps, :]
         mask_patch = mask[:, y0:y0 + ps, x0:x0 + ps]
+
+        if self.augment:
+            mask_hwc = mask_patch.transpose(1, 2, 0)
+            augmented = SEG_AUG(image=img_patch, mask=mask_hwc)
+            img_patch = augmented["image"]
+            mask_patch = augmented["mask"].transpose(2, 0, 1)
 
         img_t = torch.from_numpy(img_patch.transpose(2, 0, 1).copy()).float() / 255.0
         mask_t = torch.from_numpy(mask_patch.copy()).float()

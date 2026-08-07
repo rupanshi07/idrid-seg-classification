@@ -1,6 +1,7 @@
 ﻿import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import cohen_kappa_score
 
 
 class DiceLoss(nn.Module):
@@ -23,7 +24,7 @@ class FocalLoss(nn.Module):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.pos_weight = pos_weight  # tensor [C] or None
+        self.pos_weight = pos_weight
 
     def forward(self, logits, targets):
         pw = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
@@ -57,3 +58,10 @@ def mean_dice_per_lesion(logits, targets, threshold=0.5, smooth=1e-6):
     union = preds.sum(dims) + targets.sum(dims)
     dice = (2 * intersection + smooth) / (union + smooth)
     return dice
+
+
+def quadratic_weighted_kappa(preds, targets):
+    """preds, targets: 1D lists/tensors of int class labels 0-4."""
+    preds = [int(p) for p in preds]
+    targets = [int(t) for t in targets]
+    return cohen_kappa_score(targets, preds, weights="quadratic")
