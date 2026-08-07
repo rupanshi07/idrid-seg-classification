@@ -7,12 +7,11 @@ from torch.amp import autocast, GradScaler
 from itertools import cycle
 
 from src.datasets.idrid_dataset import SegDataset, ClsDataset
+from src.datasets.patch_dataset import PatchSegDataset
 from src.models.unet_multitask import MultiTaskUNet
 from src.losses.losses import SegComboLoss, mean_dice_per_lesion
 
 LESIONS = ["Microaneurysms", "Haemorrhages", "Hard_Exudates", "Soft_Exudates", "Optic_Disc"]
-
-# sqrt-scaled pos_weight from measured foreground ratios (MA, HE, EX, SE, OD)
 POS_WEIGHT = torch.tensor([28.8, 9.9, 10.7, 22.7, 7.4])
 
 
@@ -49,11 +48,13 @@ def evaluate(model, seg_loader, cls_loader, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default=r"D:\IDRID2\DATASET")
-    parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--accum_steps", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patch_size", type=int, default=256)
+    parser.add_argument("--patch_batch_size", type=int, default=6)
+    parser.add_argument("--patches_per_image", type=int, default=6)
+    parser.add_argument("--eval_img_size", type=int, default=1024)
+    parser.add_argument("--cls_batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
@@ -61,21 +62,22 @@ def main():
     print("Using device:", device)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    train_seg = SegDataset(args.data_root, split="Training", img_size=args.img_size)
-    test_seg = SegDataset(args.data_root, split="Testing", img_size=args.img_size)
-    train_cls = ClsDataset(args.data_root, split="Training", img_size=args.img_size)
-    test_cls = ClsDataset(args.data_root, split="Testing", img_size=args.img_size)
+    train_seg = PatchSegDataset(args.data_root, split="Training", img_size=args.eval_img_size,
+                                 patch_size=args.patch_size, patches_per_image=args.patches_per_image)
+    test_seg = SegDataset(args.data_root, split="Testing", img_size=args.eval_img_size)
+    train_cls = ClsDataset(args.data_root, split="Training", img_size=args.eval_img_size)
+    test_cls = ClsDataset(args.data_root, split="Testing", img_size=args.eval_img_size)
 
-    train_seg_loader = DataLoader(train_seg, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    train_cls_loader = DataLoader(train_cls, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    test_seg_loader = DataLoader(test_seg, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_cls_loader = DataLoader(test_cls, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_seg_loader = DataLoader(train_seg, batch_size=args.patch_batch_size, shuffle=True, num_workers=2)
+    train_cls_loader = DataLoader(train_cls, batch_size=args.cls_batch_size, shuffle=True, num_workers=2)
+    test_seg_loader = DataLoader(test_seg, batch_size=1, shuffle=False, num_workers=0)
+    test_cls_loader = DataLoader(test_cls, batch_size=1, shuffle=False, num_workers=0)
 
     model = MultiTaskUNet().to(device)
     seg_loss_fn = SegComboLoss(pos_weight=POS_WEIGHT)
     cls_loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=10)
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
     best_mean_dice = 0.0
@@ -85,15 +87,16 @@ def main():
         cls_iter = cycle(train_cls_loader)
         running_seg_loss, running_cls_loss = 0.0, 0.0
         n_steps = 0
-        optimizer.zero_grad()
 
-        for step, seg_batch in enumerate(train_seg_loader):
+        for seg_batch in train_seg_loader:
             cls_batch = next(cls_iter)
 
             images_seg = seg_batch["image"].to(device)
             masks = seg_batch["mask"].to(device)
             images_cls = cls_batch["image"].to(device)
             grades = cls_batch["grade"].to(device)
+
+            optimizer.zero_grad()
 
             with autocast(device_type="cuda", enabled=(device.type == "cuda")):
                 seg_logits, _ = model(images_seg, task="seg")
@@ -102,14 +105,11 @@ def main():
                 _, cls_logits = model(images_cls, task="cls")
                 cls_loss = cls_loss_fn(cls_logits, grades)
 
-                loss = (seg_loss + cls_loss) / args.accum_steps
+                loss = seg_loss + cls_loss
 
             scaler.scale(loss).backward()
-
-            if (step + 1) % args.accum_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_seg_loss += seg_loss.item()
             running_cls_loss += cls_loss.item()
